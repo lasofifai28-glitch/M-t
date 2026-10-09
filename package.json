@@ -9,6 +9,8 @@
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev --workspace server\" \"npm run dev --workspace web\"",
     "dev:server": "npm run dev --workspace server",
     "dev:web": "npm run dev --workspace web",
+    "termux:dev": "bash scripts/termux-dev.sh",
+    "termux:package": "bash scripts/package-termux.sh",
     "build": "npm run build --workspace web",
     "start": "npm run start --workspace server"
   },

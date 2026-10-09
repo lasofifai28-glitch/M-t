@@ -2,19 +2,24 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { io } from 'socket.io-client';
 
-const API_BASE = 'http://localhost:4000';
-const socket = io(API_BASE, { autoConnect: false });
+const API_BASE = import.meta.env.VITE_API_URL || `http://${window.location.hostname || 'localhost'}:4000`;
 
 async function api(path, options = {}) {
   const token = localStorage.getItem('auth_token');
+  const headers = { ...(options.headers || {}) };
+
+  if (!(options.data instanceof FormData)) {
+    headers['Content-Type'] = headers['Content-Type'] || 'application/json';
+  }
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
   const response = await axios({
     url: `${API_BASE}${path}`,
     ...options,
-    headers: {
-      ...(options.headers || {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      'Content-Type': options.headers?.['Content-Type'] || 'application/json',
-    },
+    headers,
   });
 
   return response.data;
@@ -44,6 +49,7 @@ function AuthScreen({ onAuthenticated }) {
   const [displayName, setDisplayName] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -67,6 +73,7 @@ function AuthScreen({ onAuthenticated }) {
       } else {
         setMode('login');
         setPassword('');
+        setDisplayName('');
       }
     } catch (requestError) {
       setError(requestError.response?.data?.error || 'Request failed.');
@@ -104,7 +111,17 @@ function AuthScreen({ onAuthenticated }) {
 
           <label>
             <span>Password</span>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+            <div className="password-row">
+              <input
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+              <button type="button" className="tiny" onClick={() => setShowPassword((value) => !value)}>
+                {showPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
           </label>
 
           {error && <div className="error-box">{error}</div>}
@@ -127,16 +144,28 @@ function ChatApp({ currentUser, onLogout }) {
   const [draft, setDraft] = useState('');
   const [typingUser, setTypingUser] = useState('');
   const [callState, setCallState] = useState({ active: false, peer: null, type: 'audio' });
+  const [pendingFiles, setPendingFiles] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
-
   const socketRef = useRef(null);
+
+  const refreshConversations = async () => {
+    const data = await api('/api/conversations');
+    const list = data.conversations || [];
+    setConversations(list);
+    if (!selectedId && list[0]) {
+      setSelectedId(list[0].id);
+    }
+  };
 
   useEffect(() => {
     const token = localStorage.getItem('auth_token');
     if (!token) return;
 
     socketRef.current = io(API_BASE, { auth: { token } });
+
     socketRef.current.on('connect', () => {
       socketRef.current.emit('presence:online', { userId: currentUser.id });
     });
@@ -167,7 +196,7 @@ function ChatApp({ currentUser, onLogout }) {
     });
 
     socketRef.current.on('call:offer', async ({ fromUserId, offer }) => {
-      const pc = await createPeerConnection();
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       peerConnectionRef.current = pc;
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
@@ -193,14 +222,6 @@ function ChatApp({ currentUser, onLogout }) {
 
     return () => socketRef.current?.disconnect();
   }, [currentUser.id, selectedId]);
-
-  async function refreshConversations() {
-    const data = await api('/api/conversations');
-    setConversations(data.conversations || []);
-    if (!selectedId && data.conversations[0]) {
-      setSelectedId(data.conversations[0].id);
-    }
-  }
 
   useEffect(() => {
     refreshConversations();
@@ -231,27 +252,73 @@ function ChatApp({ currentUser, onLogout }) {
   }, [search]);
 
   async function startConversation(userId) {
-    const data = await api('/api/conversations', {
+    const result = await api('/api/conversations', {
       method: 'POST',
       data: { otherUserId: userId },
     });
-    setSelectedId(data.conversation.id);
+
+    const conversationId = result.conversation.id;
+    setSelectedId(conversationId);
     setSearch('');
-    refreshConversations();
+    await refreshConversations();
+  }
+
+  async function uploadFiles(files) {
+    const attached = [];
+    const maxSize = Number(import.meta.env.VITE_UPLOAD_LIMIT_MB || 25) * 1024 * 1024;
+
+    for (const file of files) {
+      if (file.size > maxSize) {
+        throw new Error(`${file.name} exceeds the ${import.meta.env.VITE_UPLOAD_LIMIT_MB || 25}MB limit.`);
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+      const result = await api('/api/uploads', {
+        method: 'POST',
+        data: formData,
+      });
+
+      attached.push({
+        fileName: result.attachment.fileName,
+        mimeType: result.attachment.mimeType,
+        size: result.attachment.size,
+        storagePath: result.attachment.storagePath,
+        url: result.attachment.url,
+      });
+    }
+
+    return attached;
   }
 
   async function sendMessage(e) {
     e.preventDefault();
-    if (!selectedId || !draft.trim()) return;
+    if (!selectedId || (!draft.trim() && pendingFiles.length === 0)) return;
 
-    const data = await api(`/api/conversations/${selectedId}/messages`, {
-      method: 'POST',
-      data: { text: draft },
-    });
+    try {
+      setUploading(true);
+      setUploadError('');
 
-    setDraft('');
-    setMessages((prev) => [...prev, { ...data.message, attachments: data.message.attachments || [] }]);
-    refreshConversations();
+      const attachments = pendingFiles.length > 0 ? await uploadFiles(pendingFiles) : [];
+      const payload = {
+        text: draft.trim(),
+        attachments,
+      };
+
+      const response = await api(`/api/conversations/${selectedId}/messages`, {
+        method: 'POST',
+        data: payload,
+      });
+
+      setMessages((prev) => [...prev, { ...response.message, attachments: response.message.attachments || [] }]);
+      setDraft('');
+      setPendingFiles([]);
+      await refreshConversations();
+    } catch (error) {
+      setUploadError(error.response?.data?.error || error.message || 'Unable to send message.');
+    } finally {
+      setUploading(false);
+    }
   }
 
   function startTyping() {
@@ -261,8 +328,7 @@ function ChatApp({ currentUser, onLogout }) {
 
   async function startCall(type = 'audio') {
     if (!selectedId) return;
-    const conversationUsers = conversations.find((item) => item.id === selectedId);
-    const otherUserId = conversationUsers?.participantId || currentUser.id;
+    const peer = conversations.find((item) => item.id === selectedId)?.participantId || currentUser.id;
 
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     peerConnectionRef.current = pc;
@@ -272,20 +338,20 @@ function ChatApp({ currentUser, onLogout }) {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socketRef.current?.emit('call:ice-candidate', { toUserId: otherUserId, candidate: event.candidate });
+        socketRef.current?.emit('call:ice-candidate', { toUserId: peer, candidate: event.candidate });
       }
     };
 
     pc.ontrack = (event) => {
       if (event.streams?.[0]) {
-        setCallState({ active: true, peer: otherUserId, type, incoming: false, remoteStream: event.streams[0] });
+        setCallState({ active: true, peer, type, incoming: false, remoteStream: event.streams[0] });
       }
     };
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    socketRef.current?.emit('call:offer', { toUserId: otherUserId, offer });
-    setCallState({ active: true, peer: otherUserId, type, incoming: false });
+    socketRef.current?.emit('call:offer', { toUserId: peer, offer });
+    setCallState({ active: true, peer, type, incoming: false });
   }
 
   async function acceptCall() {
@@ -392,7 +458,30 @@ function ChatApp({ currentUser, onLogout }) {
               ))}
             </div>
 
+            {pendingFiles.length > 0 && (
+              <div className="attachment-list">
+                {pendingFiles.map((file) => (
+                  <span key={`${file.name}-${file.size}`} className="attachment-chip">{file.name}</span>
+                ))}
+              </div>
+            )}
+
+            {uploadError && <div className="error-box">{uploadError}</div>}
+
             <form onSubmit={sendMessage} className="composer">
+              <label className="file-picker">
+                <span>+ Attach</span>
+                <input
+                  type="file"
+                  multiple
+                  onChange={(event) => {
+                    if (event.target.files) {
+                      setPendingFiles(Array.from(event.target.files));
+                    }
+                  }}
+                />
+              </label>
+
               <input
                 value={draft}
                 onChange={(e) => {
@@ -401,7 +490,7 @@ function ChatApp({ currentUser, onLogout }) {
                 }}
                 placeholder="Write a message..."
               />
-              <button type="submit">Send</button>
+              <button type="submit" disabled={uploading}>{uploading ? 'Sending...' : 'Send'}</button>
             </form>
           </>
         ) : (

@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -39,11 +40,12 @@ const io = new Server(server, {
 });
 
 const PORT = Number(process.env.PORT || 4000);
+const MAX_UPLOAD_BYTES = Number(process.env.UPLOAD_LIMIT_MB || 25) * 1024 * 1024;
 const uploadRoot = path.resolve(process.cwd(), 'uploads');
 fs.mkdirSync(uploadRoot, { recursive: true });
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({ origin: process.env.CLIENT_URL || true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/uploads', express.static(uploadRoot));
 
@@ -61,7 +63,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (_req, file, cb) => {
     const allowed = ['image/', 'video/', 'application/pdf', 'text/plain', 'application/zip'];
     const isAllowed = allowed.some((type) => file.mimetype.startsWith(type) || file.mimetype === type);
@@ -227,9 +229,23 @@ app.post('/api/uploads', authMiddleware, upload.single('file'), (req, res) => {
 });
 
 app.get('/api/attachments/:id', authMiddleware, (req, res) => {
-  const attachment = getAttachmentById(req.params.id);
+  const attachment = db.prepare(`
+    SELECT a.*, m.conversation_id, m.sender_id
+    FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    WHERE a.id = ?
+  `).get(req.params.id);
+
   if (!attachment) {
     return res.status(404).json({ error: 'Attachment not found.' });
+  }
+
+  const hasAccess = db.prepare(`
+    SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?
+  `).get(attachment.conversation_id, req.user.id);
+
+  if (!hasAccess) {
+    return res.status(403).json({ error: 'You do not have access to this file.' });
   }
 
   const resolved = path.resolve(process.cwd(), attachment.storage_path);
@@ -312,6 +328,15 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     socket.broadcast.emit('presence:update', { userId, online: false });
   });
+});
+
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Change PORT in .env or stop the current process and try again.`);
+    process.exit(1);
+  }
+
+  throw error;
 });
 
 server.listen(PORT, () => {
