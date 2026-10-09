@@ -279,13 +279,7 @@ function ChatApp({ currentUser, onLogout }) {
         data: formData,
       });
 
-      attached.push({
-        fileName: result.attachment.fileName,
-        mimeType: result.attachment.mimeType,
-        size: result.attachment.size,
-        storagePath: result.attachment.storagePath,
-        url: result.attachment.url,
-      });
+      attached.push(result.attachment.uploadId);
     }
 
     return attached;
@@ -299,10 +293,9 @@ function ChatApp({ currentUser, onLogout }) {
       setUploading(true);
       setUploadError('');
 
-      const attachments = pendingFiles.length > 0 ? await uploadFiles(pendingFiles) : [];
       const payload = {
         text: draft.trim(),
-        attachments,
+        uploadIds: pendingFiles.length > 0 ? await uploadFiles(pendingFiles) : [],
       };
 
       const response = await api(`/api/conversations/${selectedId}/messages`, {
@@ -318,6 +311,24 @@ function ChatApp({ currentUser, onLogout }) {
       setUploadError(error.response?.data?.error || error.message || 'Unable to send message.');
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function downloadAttachment(attachment) {
+    try {
+      const token = localStorage.getItem('auth_token');
+      const response = await axios.get(`${API_BASE}/api/attachments/${attachment.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        responseType: 'blob',
+      });
+      const objectUrl = URL.createObjectURL(response.data);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = attachment.fileName || attachment.file_name || 'attachment';
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setUploadError(error.response?.data?.error || 'Unable to download this attachment.');
     }
   }
 
@@ -446,9 +457,9 @@ function ChatApp({ currentUser, onLogout }) {
                       <ul className="attachments">
                         {message.attachments.map((attachment) => (
                           <li key={attachment.id}>
-                            <a href={`${API_BASE}${attachment.url || ''}`} target="_blank" rel="noreferrer">
+                            <button type="button" className="attachment-link" onClick={() => downloadAttachment(attachment)}>
                               {attachment.fileName || attachment.file_name}
-                            </a>
+                            </button>
                           </li>
                         ))}
                       </ul>

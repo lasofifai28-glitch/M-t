@@ -42,12 +42,12 @@ const io = new Server(server, {
 const PORT = Number(process.env.PORT || 4000);
 const MAX_UPLOAD_BYTES = Number(process.env.UPLOAD_LIMIT_MB || 25) * 1024 * 1024;
 const uploadRoot = path.resolve(process.cwd(), 'uploads');
+const pendingUploads = new Map();
 fs.mkdirSync(uploadRoot, { recursive: true });
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: process.env.CLIENT_URL || true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
-app.use('/uploads', express.static(uploadRoot));
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 const messageLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
@@ -188,13 +188,29 @@ app.get('/api/conversations/:id/messages', authMiddleware, (req, res) => {
 app.post('/api/conversations/:id/messages', authMiddleware, messageLimiter, (req, res) => {
   try {
     const payload = req.body || {};
+    const uploadIds = payload.uploadIds || [];
+    if (!Array.isArray(uploadIds)) {
+      return res.status(400).json({ error: 'uploadIds must be an array.' });
+    }
+
+    const attachments = uploadIds.map((uploadId) => {
+      const pending = pendingUploads.get(uploadId);
+      if (!pending || pending.userId !== req.user.id) {
+        throw new Error('An uploaded file is missing or does not belong to this account.');
+      }
+
+      return pending.attachment;
+    });
+
     const message = addMessage({
       conversationId: req.params.id,
       senderId: req.user.id,
       text: payload.text || '',
       type: payload.type || 'text',
-      attachments: payload.attachments || [],
+      attachments,
     });
+
+    uploadIds.forEach((uploadId) => pendingUploads.delete(uploadId));
 
     io.to(`conversation:${req.params.id}`).emit('message:new', {
       ...message,
@@ -217,15 +233,16 @@ app.post('/api/uploads', authMiddleware, upload.single('file'), (req, res) => {
     return res.status(400).json({ error: 'No file uploaded.' });
   }
 
+  const uploadId = randomUUID();
   const attachment = {
     fileName: req.file.originalname,
     mimeType: req.file.mimetype,
     size: req.file.size,
     storagePath: path.relative(process.cwd(), req.file.path),
-    url: `/uploads/${path.basename(req.file.path)}`,
   };
+  pendingUploads.set(uploadId, { userId: req.user.id, attachment });
 
-  res.json({ attachment });
+  res.status(201).json({ attachment: { uploadId, ...attachment } });
 });
 
 app.get('/api/attachments/:id', authMiddleware, (req, res) => {
@@ -249,6 +266,11 @@ app.get('/api/attachments/:id', authMiddleware, (req, res) => {
   }
 
   const resolved = path.resolve(process.cwd(), attachment.storage_path);
+  const relativePath = path.relative(uploadRoot, resolved);
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return res.status(400).json({ error: 'Invalid attachment path.' });
+  }
+
   if (!fs.existsSync(resolved)) {
     return res.status(404).json({ error: 'File no longer exists.' });
   }
@@ -328,6 +350,19 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     socket.broadcast.emit('presence:update', { userId, online: false });
   });
+});
+
+app.use((error, _req, res, _next) => {
+  if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: `File exceeds the ${process.env.UPLOAD_LIMIT_MB || 25}MB limit.` });
+  }
+
+  if (error.message === 'Unsupported file type.') {
+    return res.status(400).json({ error: error.message });
+  }
+
+  console.error(error);
+  return res.status(500).json({ error: 'An unexpected server error occurred.' });
 });
 
 server.on('error', (error) => {

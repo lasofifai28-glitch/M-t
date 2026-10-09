@@ -200,7 +200,7 @@ export function addMessage({ conversationId, senderId, text = '', type = 'text',
         attachment.mimeType || 'application/octet-stream',
         Number(attachment.size || 0),
         attachment.storagePath || '',
-        attachment.url || '',
+        `/api/attachments/${attachmentId}`,
         senderId,
         createdAt
       );
@@ -211,6 +211,8 @@ export function addMessage({ conversationId, senderId, text = '', type = 'text',
     UPDATE conversations SET updated_at = ? WHERE id = ?
   `).run(createdAt, conversationId);
 
+  const savedAttachments = db.prepare('SELECT * FROM attachments WHERE message_id = ?').all(messageId);
+
   return {
     id: messageId,
     conversationId,
@@ -219,13 +221,12 @@ export function addMessage({ conversationId, senderId, text = '', type = 'text',
     content: text,
     createdAt,
     status: 'sent',
-    attachments: attachments.map((attachment) => ({
-      id: randomUUID(),
-      fileName: attachment.fileName || 'file',
-      mimeType: attachment.mimeType || 'application/octet-stream',
-      size: Number(attachment.size || 0),
-      url: attachment.url || '',
-      storagePath: attachment.storagePath || '',
+    attachments: savedAttachments.map((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.file_name,
+      mimeType: attachment.mime_type,
+      size: attachment.size,
+      url: attachment.url,
     })),
   };
 }
